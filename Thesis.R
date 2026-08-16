@@ -1,5 +1,6 @@
 library(readxl)
 library(dplyr)
+library(here)
 source("functions/moving_block_bootstrap.R")
 source("functions/Reddington.R")
 source("functions/ARVA.R")
@@ -15,37 +16,42 @@ script_start_time <- Sys.time()
 
 # Data --------------------------------------------------------------------
 
-# Improting Data & separating exchange rate and inflation rate data
+# --- 1. Import data ---
+Bond_Equity_Data <- read_excel(here("data", "Bond & Equity Data.xlsx"), sheet = "LT_DATA", skip = 1)
+CPI_Data <- read_excel(here("data", "CPI_Index_Long_Format.xlsx"))
 
-Bond_Equity_Data = read_excel("data/Bond & Equity Data.xlsx", sheet = "LT_DATA", skip = 1)
-#CPI_Data = read_excel("/Users/greighutchison/Library/CloudStorage/OneDrive-UniversityofCapeTown/UCT Honours/BUS4129H - Honours Research Project/Code Directory/Act Sci Thesis/Data/CPI_Index_Long_Format.xlsx")
-#Mortality = read_excel("/Users/greighutchison/Library/CloudStorage/OneDrive-UniversityofCapeTown/UCT Honours/BUS4129H - Honours Research Project/Code Directory/Act Sci Thesis/Data/SAIML98_SAIFL98_Mortality_Table.xlsx")[c(-1,-2),]
-#USDZAR = na.omit(Bond_Equity_Data[c(1,11)])
+# --- 2. Clean Bond_Equity_Data ---
+colnames(Bond_Equity_Data)[1] <- "Date"
+colnames(Bond_Equity_Data) <- make.names(colnames(Bond_Equity_Data))
+Bond_Equity_Data$Date <- as.Date(Bond_Equity_Data$Date)
 
-# 2. Rename the first column to "Date" and clean column names (replace spaces with underscores)
-colnames(Bond_Equity_Data )[1] = "Date"
-colnames(Bond_Equity_Data ) = make.names(colnames(Bond_Equity_Data))
+# --- 3. Trim to usable range and compute equity/bond returns ---
+Bond_Equity_Data <- na.omit(Bond_Equity_Data[-1:-407, 1:3])
+prices <- Bond_Equity_Data[, c("SA.Equity.ZAR", "SA.Bonds.ZAR")]
+temp_returns <- prices[-1, ] / prices[-nrow(prices), ]
 
-# 3. Format Date as a proper R Date object
-Bond_Equity_Data $Date = as.Date(Bond_Equity_Data $Date)
+BE_Returns <- data.frame(
+  YearMon       = format(Bond_Equity_Data$Date[-1], "%Y-%m"),
+  SA.Equity.ZAR = temp_returns$SA.Equity.ZAR,
+  SA.Bonds.ZAR  = temp_returns$SA.Bonds.ZAR
+)
 
-# Converting data to returns format
-Bond_Equity_Data = na.omit(Bond_Equity_Data[-1:-420,1:3])
-temp_be_data = Bond_Equity_Data[,-1]
-temp_returns = temp_be_data[-1,]/temp_be_data[rep(1, 377), ]
-BE_Returns = data.frame(Date = Bond_Equity_Data[-1, 1], temp_returns)
-plot(BE_Returns[,2])
+# --- 4. CPI cleaning / inflation growth construction ---
+CPI_sub <- CPI_Data[168:558, ]  # Dec 1993 to end
+cpi_dates <- as.Date(paste0("01 ", CPI_sub$Date), format = "%d %b %Y")
+cpi_values <- CPI_sub$`CPI Index`
+inf_growth_ratios <- cpi_values[-1] / cpi_values[-length(cpi_values)]
 
-prices = Bond_Equity_Data[, c("SA.Equity.ZAR", "SA.Bonds.ZAR")]
-temp_returns = prices[-1, ] / prices[-nrow(prices), ]
+Inf_index_clean <- data.frame(
+  YearMon    = format(cpi_dates[-1], "%Y-%m"),
+  Inf_Growth = inf_growth_ratios
+)
 
-BE_Returns = data.frame(Date = Bond_Equity_Data[-1, 1], temp_returns)
+# --- 5. Merge equity/bond returns with inflation on YearMon ---
+combined_data <- merge(BE_Returns, Inf_index_clean, by = "YearMon")
+combined_data_clean <- combined_data[complete.cases(combined_data), ]
 
-BE_Returns_clean = BE_Returns[complete.cases(BE_Returns), ]
-
-returns_matrix = as.matrix(BE_Returns_clean[, c("SA.Equity.ZAR", "SA.Bonds.ZAR")])
-
-
+returns_matrix <- as.matrix(combined_data_clean[, c("SA.Equity.ZAR", "SA.Bonds.ZAR", "Inf_Growth")])
 
 # Bootstrapping -----------------------------------------------------------
 
@@ -71,15 +77,21 @@ head(returns_matrix)
 #Actual monthly returns for the equity sleeve (all sims)
 equity_monthly_returns = sim_paths[, "SA.Equity.ZAR", ]   # [horizon x n_sims], raw period returns
 bond_monthly_returns   = sim_paths[, "SA.Bonds.ZAR", ]    # same, raw period returns
+inflation_monthly_ratios = sim_paths[, "Inf_Growth", ]    # [horizon x n_sims], raw monthly inflation growth ratios
 
 # Parameters
 pot <- 10000000
-wd <- 0.08                # Bond ladder withdrawal rate the retiree wants to secure each year
-ladder_length <- 6        # STARTING ladder length - can extend annually up to max_ladder_years
+wd <- 0.05                # Bond ladder withdrawal rate the retiree wants to secure each year
+ladder_length <- 10        # STARTING ladder length - can extend annually up to max_ladder_years
 max_ladder_years <- 15    # Hard cap - reaching it forces liquidation into equity, unconditionally
 extend_by <- 1            # Years added per Extend & Harvest decision (kept as a parameter, per request)
 defend_cut <- 0.05        # Withdrawal cut applied on a Defend year (passed through to decision_matrix())
-inflation_rate <- 0.05    # PLACEHOLDER fixed rate - to be replaced once CPI is bootstrapped in
+inflation_rate <- 0.05    # Flat EXPECTED rate - still used for compute_funded_ratio()'s forward
+                           # liability projection and decision_matrix()'s annual raise (both are
+                           # forward-looking, so can't discount against inflation that hasn't
+                           # happened yet). The actual monthly cash withdrawal is now indexed to
+                           # the REALIZED bootstrapped inflation_monthly_ratios path instead (see
+                           # run_dynamic_ladder_simulation() call below), not this flat number.
 bequeathment_pct <- 0.10  # Retiree-set: fraction of the starting pot they want left over at the end of the horizon
 horizon <- 360
 num_sims <- ncol(equity_monthly_returns)
@@ -145,7 +157,8 @@ cash_buffer <- size_ladder_cash_buffer(
   bond_cf           = bond_cf,
   ladder_years      = ladder_length,
   annual_withdrawal = wd * pot,
-  cash_annual_rate  = cash_annual_rate
+  cash_annual_rate  = cash_annual_rate,
+  inflation_rate    = inflation_rate
 )
 cash_monthly_rate <- cash_buffer$cash_monthly_rate
 C0                <- cash_buffer$C0
@@ -201,7 +214,8 @@ sim_result <- run_dynamic_ladder_simulation(
   max_age                 = max_age,
   res_redington_initial   = res_redington,
   C0_initial              = C0,
-  bond_cf_initial         = bond_cf
+  bond_cf_initial         = bond_cf,
+  inflation_monthly_ratios = inflation_monthly_ratios
 )
 sim_run_end_time <- Sys.time()
 cat(sprintf("\nDynamic ladder + ARVA simulation runtime (%d paths x %d months): %s\n",

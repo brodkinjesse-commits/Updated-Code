@@ -10,17 +10,30 @@
 # ladder target. A funded_ratio >= 1 means total assets can support every
 # future expense, not merely "can fund the ladder to its own end".
 #
-# expected_annual_expense is treated as flat (today's currently-secured
-# withdrawal, current_income) for every future year - same flat-expense
-# convention already used for the bond ladder's own liability in
-# calculate_liability_metrics().
+# expected_annual_expense is today's currently-secured withdrawal
+# (current_income) - the retiree's real, parameter-defined spending level
+# right now. Each future year's expense is no longer held flat in nominal
+# terms: it is grown forward from expected_annual_expense at inflation_rate,
+# so the liability reflects the real purchasing power the retiree will
+# actually need in year t, not today's rand amount repeated 30 times. This
+# mirrors the same cumulative-CPI indexation applied to the actual monthly
+# cash withdrawal in run_dynamic_ladder_simulation(), so a path whose real
+# spending is rising with inflation shows a correspondingly larger
+# liability - the funded ratio can only fall due to genuine erosion of real
+# purchasing power, not sit artificially flat while nominal costs climb.
+# inflation_rate defaults to 0 (old flat-expense behaviour) so any other
+# caller of this function that hasn't been updated to pass it - e.g. the
+# duplicated toggle wrapper in Sensitivity_Analysis.R - keeps working
+# unchanged.
 # ------------------------------------------------------------------------
 compute_funded_ratio <- function(equity_value, cash_value, bond_value,
-                                 expected_annual_expense, horizon_years) {
+                                 expected_annual_expense, horizon_years,
+                                 inflation_rate = 0) {
 
   t_vec <- 1:horizon_years
   y_vec <- curve_yield(t_vec) / 100
-  pv_t  <- expected_annual_expense * (1 + y_vec)^(-t_vec)
+  inflated_expense_t <- expected_annual_expense * (1 + inflation_rate)^t_vec
+  pv_t  <- inflated_expense_t * (1 + y_vec)^(-t_vec)
   cost_to_fully_fund <- sum(pv_t)
 
   total_assets <- equity_value + cash_value + bond_value
@@ -50,7 +63,8 @@ compute_funded_ratio <- function(equity_value, cash_value, bond_value,
 rebalance_ladder <- function(remaining_years, annual_withdrawal, valuation_date_now,
                              current_bond_value, current_cash_value,
                              convexity_buffer, cash_annual_rate,
-                             bond_metrics_precomputed = NULL) {
+                             bond_metrics_precomputed = NULL,
+                             inflation_rate = 0, inflation_factors = NULL) {
 
   res <- optimize_redington_immunization(
     total_pot_value      = annual_withdrawal,
@@ -73,7 +87,9 @@ rebalance_ladder <- function(remaining_years, annual_withdrawal, valuation_date_
     bond_cf           = new_cf,
     ladder_years      = remaining_years,
     annual_withdrawal = annual_withdrawal,
-    cash_annual_rate  = cash_annual_rate
+    cash_annual_rate  = cash_annual_rate,
+    inflation_rate    = inflation_rate,
+    inflation_factors = inflation_factors
   )
   new_C0 <- new_buffer$C0
 
@@ -118,7 +134,8 @@ run_dynamic_ladder_simulation <- function(
     equity_monthly_returns, horizon,
     cash_annual_rate, defend_cut, inflation_rate,
     start_age, max_age,
-    res_redington_initial, C0_initial, bond_cf_initial
+    res_redington_initial, C0_initial, bond_cf_initial,
+    inflation_monthly_ratios = NULL
 ) {
 
   num_sims <- ncol(equity_monthly_returns)
@@ -126,10 +143,44 @@ run_dynamic_ladder_simulation <- function(
   bond_codes <- res_redington_initial$bond_metrics$bond_code
   cash_monthly_rate <- (1 + cash_annual_rate)^(1/12) - 1
 
+  # Starting annual base payout, from the retiree's configured withdrawal-rate
+  # parameter (wd) and starting wealth (pot) - both already threaded through
+  # from Thesis.R's run parameters, not hardcoded here. Every path's
+  # current_income starts at exactly this amount and is this path's own
+  # "current base annual withdrawal" for CPI-indexation purposes thereafter
+  # (see income_reset_month below).
+  base_annual_withdrawal <- wd * pot
+
+  # Realized cumulative CPI index per path, built from the actual bootstrapped
+  # monthly inflation path (same [horizon x num_sims] convention as
+  # equity_monthly_returns) rather than a flat compounding assumption -
+  # cum_inflation[m, s] / cum_inflation[r, s] is the realized inflation growth
+  # factor between month r and month m for path s, used below to index each
+  # path's own monthly cash withdrawal to what CPI has actually done for it,
+  # not a deterministic average. inflation_rate (the flat scalar) is kept for
+  # what it's still legitimately used for elsewhere - decision_matrix()'s
+  # forward-looking annual raise and compute_funded_ratio()'s forward
+  # liability projection - since neither can discount against inflation that
+  # hasn't happened yet. If no stochastic path is supplied, the monthly
+  # payout falls back to compounding inflation_rate flat, so any caller not
+  # yet passing one still works unchanged.
+  cum_inflation <- if (!is.null(inflation_monthly_ratios)) {
+    apply(inflation_monthly_ratios, 2, cumprod)
+  } else {
+    NULL
+  }
+
   # ---- Per-path state -----------------------------------------------------
   phase                <- rep("ladder", num_sims)     # "ladder" or "arva"
   ladder_years_current <- rep(ladder_length, num_sims)
-  current_income       <- rep(wd * pot, num_sims)
+  current_income       <- rep(base_annual_withdrawal, num_sims)
+  # Month at which current_income[s] was last (re)established - month 1 at
+  # simulation start, then reset to the review month m whenever Extend &
+  # Harvest / Defend changes current_income. Cumulative CPI for the monthly
+  # payout (below) is measured from this month, so the annual review's own
+  # extend/defend adjustment and the monthly inflation step-up compound
+  # cleanly instead of double-counting a year of inflation.
+  income_reset_month   <- rep(1L, num_sims)
   infeasible_flag       <- rep(FALSE, num_sims)
   bond_sale_amount      <- rep(NA_real_, num_sims)  # set once, at the moment each path's ladder ends
   duration_matched_flag <- rep(TRUE, num_sims)   # FALSE once a path has used the relaxed fallback
@@ -173,7 +224,14 @@ run_dynamic_ladder_simulation <- function(
   EPort_history[1, ] <- EPort
   Cash_history[1, ]  <- cash_account
 
-  current_monthly_withdrawal <- current_income / 12  # per-path, changes on Extend/Defend
+  # ARVA-phase-only monthly draw cache: set fresh every 12 months from
+  # EPort / arva_annuity_factor() (see the cash mechanics loop below) before
+  # it is ever read, so its initial value here is never actually used. The
+  # ladder phase no longer uses a cached monthly figure at all - its payout
+  # is recomputed every month from current_income[s] and cumulative CPI
+  # since income_reset_month[s] (see below), so it can step up smoothly
+  # between annual reviews rather than staying flat for 12 months.
+  current_monthly_withdrawal <- rep(NA_real_, num_sims)
 
   # ---- Main monthly loop ---------------------------------------------------
   for (m in 1:horizon) {
@@ -255,7 +313,8 @@ run_dynamic_ladder_simulation <- function(
           cash_value                = cash_account[s],
           bond_value                = bond_value_now,
           expected_annual_expense   = current_income[s],
-          horizon_years             = remaining_lifetime_years
+          horizon_years             = remaining_lifetime_years,
+          inflation_rate            = inflation_rate
         )
         trailing_ret <- prod(equity_monthly_returns[(m - 12):(m - 1), s]) - 1
 
@@ -285,6 +344,24 @@ run_dynamic_ladder_simulation <- function(
         }
         new_remaining_years <- new_ladder_years - (m - 1) / 12
 
+        # Size this rebalance's cash buffer against THIS path's own realized
+        # future inflation (already known - inflation_monthly_ratios covers
+        # the whole horizon up front, same as the equity return paths) rather
+        # than the flat expected inflation_rate, so the buffer isn't caught
+        # short by a stretch of realized inflation running well above the
+        # flat assumption (observed in testing: ~25% annualized over one
+        # path's final ladder years, versus the 5% flat rate). future_idx[1]
+        # = m so the escalation factor is exactly 1.0 in the month this
+        # withdrawal is (re)established, matching income_reset_month's own
+        # convention below. Clamped to horizon and the last available factor
+        # repeated beyond it, for a ladder sized to run past month `horizon`.
+        inflation_factors_s <- NULL
+        if (!is.null(cum_inflation)) {
+          months_needed <- ceiling(new_remaining_years * 12)
+          future_idx <- pmin(m + 0:(months_needed - 1), horizon)
+          inflation_factors_s <- cum_inflation[future_idx, s] / cum_inflation[m, s]
+        }
+
         rb <- rebalance_ladder(
           remaining_years      = new_remaining_years,
           annual_withdrawal    = dec$withdrawal,
@@ -293,7 +370,9 @@ run_dynamic_ladder_simulation <- function(
           current_cash_value   = cash_account[s],
           convexity_buffer     = convexity_buffer,
           cash_annual_rate     = cash_annual_rate,
-          bond_metrics_precomputed = bond_metrics_now
+          bond_metrics_precomputed = bond_metrics_now,
+          inflation_rate       = inflation_rate,
+          inflation_factors    = inflation_factors_s
         )
 
         if (!rb$feasible) {
@@ -327,7 +406,11 @@ run_dynamic_ladder_simulation <- function(
 
         ladder_years_current[s] <- new_ladder_years
         current_income[s] <- dec$withdrawal
-        current_monthly_withdrawal[s] <- dec$withdrawal / 12
+        # Re-anchor the CPI clock: this review's Extend/Defend adjustment IS
+        # this path's new base_annual_withdrawal going forward, so cumulative
+        # CPI for the monthly payout (below) restarts counting from THIS
+        # month rather than compounding on top of the year just applied.
+        income_reset_month[s] <- m
       }
     }
 
@@ -338,10 +421,28 @@ run_dynamic_ladder_simulation <- function(
     # just fed by whichever deposit/withdrawal schedule currently applies) --
     for (s in 1:num_sims) {
       if (phase[s] == "ladder") {
+        # Monthly outflow indexation: cumulative CPI since this path's
+        # current base_annual_withdrawal was last (re)established
+        # (income_reset_month[s] - month 1 at simulation start, or the month
+        # of its most recent Extend & Harvest / Defend review), applied to
+        # that base every month so the cash deduction steps up smoothly
+        # month-to-month instead of jumping only once a year at review time.
+        # Uses this path's own REALIZED CPI path when the caller supplied
+        # one (cum_inflation, from inflation_monthly_ratios) - each path can
+        # therefore see a genuinely different cost-of-living trajectory, not
+        # a single deterministic curve shared by all 1,000 paths - and falls
+        # back to flat compounding at inflation_rate otherwise.
+        cumulative_cpi_m <- if (!is.null(cum_inflation)) {
+          cum_inflation[m, s] / cum_inflation[income_reset_month[s], s] - 1
+        } else {
+          (1 + inflation_rate)^((m - income_reset_month[s]) / 12) - 1
+        }
+        monthly_payment_m  <- (current_income[s] / 12) * (1 + cumulative_cpi_m)
+
         cash_account[s] <- cash_account[s] + deposits_by_month[m, s]
-        cash_account[s] <- cash_account[s] - current_monthly_withdrawal[s]
+        cash_account[s] <- cash_account[s] - monthly_payment_m
         Cash_deposit_history[m, s]    <- deposits_by_month[m, s]
-        Cash_withdrawal_history[m, s] <- current_monthly_withdrawal[s]
+        Cash_withdrawal_history[m, s] <- monthly_payment_m
       } else {
         # ARVA: take the annual withdrawal at the first month of this path's
         # own ARVA phase and every 12 months thereafter (relative to its own
