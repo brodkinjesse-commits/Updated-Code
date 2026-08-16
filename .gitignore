@@ -1,0 +1,13 @@
+# Data
+Data/
+
+# R-specific
+.Rhistory
+.RData
+.Rproj.user/
+renv/library/
+renv/staging/
+
+# OS junk
+.DS_Store
+Thumbs.db
