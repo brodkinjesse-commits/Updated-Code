@@ -11,41 +11,18 @@
 # Usage from the main project:
 #
 #   source("yield_curve_simulation.R")
-#   yc <- simulate_yield_curves("data/sa_nominal_yield_curves.csv",
-#                                horizon_months = 360, n_sims = 200)
+#   Yield_Data <- read.csv("data/sa_nominal_yield_curves.csv",
+#                           stringsAsFactors = FALSE, check.names = FALSE)
+#   yc <- simulate_yield_curves(Yield_Data, horizon_months = 360, n_sims = 200)
 #   yc$get_curve(month = 84, sim = 12)   # full curve, 7 years ahead, sim 12
 #   yc$get_curve(month = 84, sim = 12)["120M"]   # just the 10Y point
 #
 # ============================================================================
 
-## ---- block bootstrap (as supplied, unmodified) ----------------------------
-moving_block_bootstrap <- function(returns_matrix,
-                                    block_size = 6,
-                                    horizon = 360,
-                                    n_sims = 1000) {
-
-  n_obs = nrow(returns_matrix)
-  n_assets = ncol(returns_matrix)
-  n_blocks_needed = ceiling(horizon / block_size)
-
-  sims = array(NA_real_, dim = c(horizon, n_assets, n_sims))
-
-  for (s in 1:n_sims) {
-    path = matrix(NA_real_, nrow = n_blocks_needed * block_size, ncol = n_assets)
-
-    for (b in 1:n_blocks_needed) {
-      start_idx = sample(1:(n_obs - block_size + 1), 1)
-      block = returns_matrix[start_idx:(start_idx + block_size - 1), , drop = FALSE]
-      rows = ((b - 1) * block_size + 1):(b * block_size)
-      path[rows, ] = block
-    }
-
-    sims[, , s] = path[1:horizon, ]
-  }
-
-  dimnames(sims) = list(NULL, colnames(returns_matrix), NULL)
-  sims
-}
+## ---- block bootstrap -------------------------------------------------------
+# Uses the shared moving_block_bootstrap() from Functions/moving_block_bootstrap.R
+# rather than defining its own copy. That file must be source()'d before this
+# one (Thesis.R already does: moving_block_bootstrap.R, ..., yield_curve_simulation.R).
 
 ## ---- construct one curve from a set of PC scores ---------------------------
 #' @param pc_scores  numeric vector, length k (scores for the retained PCs)
@@ -64,8 +41,10 @@ construct_yield_curve <- function(pc_scores, mean_curve, loadings_k, residual = 
 ## ---- fit the PCA + AR(1) model and simulate forward ------------------------
 #' Fit a yield curve PCA/AR(1) model from history and simulate it forward.
 #'
-#' @param data_path         CSV of historical yield curves (Date column +
-#'                           one column per tenor, headers like "ON","1M",...)
+#' @param data              data.frame of historical yield curves, already
+#'                           loaded (Date column + one column per tenor,
+#'                           headers like "ON","1M",...) - e.g. Yield_Data
+#'                           from read.csv("data/sa_nominal_yield_curves.csv")
 #' @param start_date        only fit the PCA on data from this date onward
 #' @param n_pca_components  k, number of PCs to retain (Level/Slope/Curvature = 3)
 #' @param block_size        months per residual bootstrap block
@@ -80,7 +59,7 @@ construct_yield_curve <- function(pc_scores, mean_curve, loadings_k, residual = 
 #'       (1..n_sims)
 #'   mean_curve, loadings_k, ar1_fits, pc_sim, resid_sim, tenors_months,
 #'       k, var_explained  - underlying model pieces, for reference/debugging
-simulate_yield_curves <- function(data_path,
+simulate_yield_curves <- function(data,
                                    start_date        = "1994-01-01",
                                    n_pca_components   = 3,
                                    block_size          = 6,
@@ -90,8 +69,12 @@ simulate_yield_curves <- function(data_path,
 
   start_date <- as.Date(start_date)
 
-  ## ---- 1. load & clean ----
-  raw <- read.csv(data_path, stringsAsFactors = FALSE, check.names = FALSE)
+  ## ---- 1. clean the already-loaded data ----
+  if (missing(data) || is.null(data)) {
+    stop("simulate_yield_curves() requires `data` - pass in a loaded ",
+         "data.frame (e.g. Yield_Data from read.csv(\"data/sa_nominal_yield_curves.csv\")).")
+  }
+  raw <- as.data.frame(data, stringsAsFactors = FALSE)
   raw$Date <- as.Date(raw$Date)
   raw <- raw[!is.na(raw$Date), ]
   raw <- raw[order(raw$Date), ]
@@ -183,5 +166,4 @@ simulate_yield_curves <- function(data_path,
     n_sims         = n_sims
   )
 }
-plot(yc$mean_curve)
 

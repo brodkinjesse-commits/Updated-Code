@@ -1,11 +1,13 @@
 library(readxl)
 library(dplyr)
 library(here)
+
 source("functions/moving_block_bootstrap.R")
 source("functions/Reddington.R")
 source("functions/ARVA.R")
 source("functions/Decision_Matrix.R")
 source("functions/Dynamic_Ladder.R")
+source("functions/yield_curve_simulation.R")
 
 # Timing --------------------------------------------------------------------
 # Overall script clock - started as early as possible (right after the
@@ -15,10 +17,10 @@ source("functions/Dynamic_Ladder.R")
 script_start_time <- Sys.time()
 
 # Data --------------------------------------------------------------------
-
 # --- 1. Import data ---
 Bond_Equity_Data <- read_excel(here("data", "Bond & Equity Data.xlsx"), sheet = "LT_DATA", skip = 1)
 CPI_Data <- read_excel(here("data", "CPI_Index_Long_Format.xlsx"))
+Yield_Data <- read_excel(here("data", "SA Nominal Yield Curves - 1989-2026.xlsx"))
 
 # --- 2. Clean Bond_Equity_Data ---
 colnames(Bond_Equity_Data)[1] <- "Date"
@@ -40,6 +42,7 @@ BE_Returns <- data.frame(
 CPI_sub <- CPI_Data[168:558, ]  # Dec 1993 to end
 cpi_dates <- as.Date(paste0("01 ", CPI_sub$Date), format = "%d %b %Y")
 cpi_values <- CPI_sub$`CPI Index`
+
 inf_growth_ratios <- cpi_values[-1] / cpi_values[-length(cpi_values)]
 
 Inf_index_clean <- data.frame(
@@ -54,14 +57,14 @@ combined_data_clean <- combined_data[complete.cases(combined_data), ]
 returns_matrix <- as.matrix(combined_data_clean[, c("SA.Equity.ZAR", "SA.Bonds.ZAR", "Inf_Growth")])
 
 # Bootstrapping -----------------------------------------------------------
-
-
 set.seed(392)
 bootstrap_start_time <- Sys.time()
+
 sim_paths = moving_block_bootstrap(returns_matrix,
                                    block_size = 6,
                                    horizon = 360,
                                    n_sims = 1000)
+
 bootstrap_end_time <- Sys.time()
 cat(sprintf("\nBootstrap runtime: %s\n", format(bootstrap_end_time - bootstrap_start_time)))
 
@@ -70,10 +73,11 @@ head(returns_matrix)
 
 #equity_path = sim_paths[, "SA.Equity.ZAR", 1]
 #plot(cumprod(equity_path), type = "l", xlab = "Month", ylab = "Cumulative Growth (Sim 1)", main = "Simulated 30-Year SA Equity Path")
-#Cumulative growth factor for one simulation's equity sleeve
 
+#Cumulative growth factor for one simulation's equity sleeve
 #equity_growth = apply(sim_paths[, "SA.Equity.ZAR", ], 2, cumprod)
 #bond_growth   = apply(sim_paths[, "SA.Bonds.ZAR", ], 2, cumprod)
+
 #Actual monthly returns for the equity sleeve (all sims)
 equity_monthly_returns = sim_paths[, "SA.Equity.ZAR", ]   # [horizon x n_sims], raw period returns
 bond_monthly_returns   = sim_paths[, "SA.Bonds.ZAR", ]    # same, raw period returns
@@ -87,11 +91,11 @@ max_ladder_years <- 15    # Hard cap - reaching it forces liquidation into equit
 extend_by <- 1            # Years added per Extend & Harvest decision (kept as a parameter, per request)
 defend_cut <- 0.05        # Withdrawal cut applied on a Defend year (passed through to decision_matrix())
 inflation_rate <- 0.05    # Flat EXPECTED rate - still used for compute_funded_ratio()'s forward
-                           # liability projection and decision_matrix()'s annual raise (both are
-                           # forward-looking, so can't discount against inflation that hasn't
-                           # happened yet). The actual monthly cash withdrawal is now indexed to
-                           # the REALIZED bootstrapped inflation_monthly_ratios path instead (see
-                           # run_dynamic_ladder_simulation() call below), not this flat number.
+# liability projection and decision_matrix()'s annual raise (both are
+# forward-looking, so can't discount against inflation that hasn't
+# happened yet). The actual monthly cash withdrawal is now indexed to
+# the REALIZED bootstrapped inflation_monthly_ratios path instead (see
+# run_dynamic_ladder_simulation() call below), not this flat number.
 bequeathment_pct <- 0.10  # Retiree-set: fraction of the starting pot they want left over at the end of the horizon
 horizon <- 360
 num_sims <- ncol(equity_monthly_returns)
@@ -99,6 +103,18 @@ num_sims <- ncol(equity_monthly_returns)
 # The portfolio is a "success" for this retiree if it ends the horizon with
 # at least this much left, rather than merely surviving above R0.
 bequeathment_target <- bequeathment_pct * pot
+
+# Yield Curve Simulation ----------------------------------------------------
+# Fits the PCA/AR(1) model to Yield_Data and simulates it forward over the
+# same horizon/n_sims as the equity & bond bootstrap above, so month/sim
+# indices line up across the two models. Query with yc$get_curve(month, sim)
+# wherever discounting or bond valuation happens below.
+yc <- simulate_yield_curves(
+  data           = Yield_Data,
+  horizon_months = horizon,
+  n_sims         = num_sims,
+  seed           = 392
+)
 
 # Bond ladder (Redington immunization) --------------------------------------
 # Finds the cheapest bond portfolio that immunizes the retiree's desired
@@ -153,6 +169,7 @@ bond_cf <- bond_cashflow_schedule(res_redington$portfolio_allocation, bonds_fixe
 # coupon/redemption deposits and paying out annual_withdrawal/12 every month
 # never goes negative across the whole ladder period.
 cash_annual_rate <- 0.05   # effective annual rate, compounded monthly (see below)
+
 cash_buffer <- size_ladder_cash_buffer(
   bond_cf           = bond_cf,
   ladder_years      = ladder_length,
@@ -236,7 +253,6 @@ print(table(sim_result$ladder_years_final))
 # -------------------------------------------------------------------------
 # 1. SUMMARY STATISTICS & DISTRIBUTION ANALYSIS
 # -------------------------------------------------------------------------
-
 cat("=======================================================\n")
 cat("      TERMINAL EQUITY PORTFOLIO (EPort) SUMMARY        \n")
 cat("=======================================================\n\n")
@@ -271,7 +287,6 @@ cat("=======================================================\n")
 # -------------------------------------------------------------------------
 # 2. PLOTTING ALL 1,000 SIMULATION PATHS
 # -------------------------------------------------------------------------
-
 # Time index and quantile trajectory vectors
 months <- 0:horizon
 p05 <- apply(EPort_history, 1, quantile, probs = 0.05)
@@ -353,7 +368,6 @@ View(
 # solvent throughout - balance should never dip below zero. Deterministic
 # (identical across sims) up to end of ladder; varies by simulation after
 # ARVA withdrawals start.
-
 plot(
   0:horizon, Cash_history[, sim_index],
   type = "l", col = "darkcyan", lwd = 2,
@@ -420,7 +434,6 @@ cat(sprintf("\nMinimum balance reached: R%s (month %d)\n",
 # sim_result$bond_sale_amount[sim_index], now returned from
 # run_dynamic_ladder_simulation() specifically so it can be shown here
 # instead of being invisible (folded silently into EPort).
-
 deposits_this_sim <- Cash_deposit_history[, sim_index]
 timeline_months <- 1:horizon
 timeline_df <- data.frame(
@@ -517,4 +530,71 @@ script_end_time <- Sys.time()
 cat("\n=======================================================\n")
 cat(sprintf("Total script runtime: %s\n", format(script_end_time - script_start_time)))
 cat("=======================================================\n")
+
+# -------------------------------------------------------------------------
+# 4. YIELD CURVE SIMULATION DIAGNOSTIC PLOTS
+# -------------------------------------------------------------------------
+# `yc` was fit earlier (Yield Curve Simulation section, above the bond ladder)
+# over the same horizon/n_sims as the equity & bond bootstrap, so month/sim
+# indices here line up with everything else in the script.
+
+# --- 4a. Historical mean curve the PCA model was fit to --------------------
+plot(
+  yc$tenors_months, yc$mean_curve,
+  type = "l", lwd = 2, col = "black",
+  xlab = "Tenor (months)", ylab = "Yield (%)",
+  main = "Historical Mean SA Nominal Yield Curve (PCA fit)"
+)
+
+# --- 4b. Simulated term structure at several horizons, one path ------------
+# Uses its own index (not the ladder simulation's `sim_index`, defined later
+# in the script) so this section can be run on its own - `yc` doesn't depend
+# on the bond ladder / dynamic simulation at all.
+yc_sim_index <- 1
+plot_months <- c(1, 60, 120, 240, 360)
+plot_months <- plot_months[plot_months <= horizon]
+curve_cols <- c("black", "steelblue", "darkorange", "firebrick", "purple")[seq_along(plot_months)]
+curves_at_months <- sapply(plot_months, function(m) yc$get_curve(month = m, sim = yc_sim_index))
+
+matplot(
+  yc$tenors_months, curves_at_months,
+  type = "l", lty = 1, lwd = 2, col = curve_cols,
+  xlab = "Tenor (months)", ylab = "Yield (%)",
+  main = sprintf("Simulated Yield Curve Term Structure Over Time (Sim #%d)", yc_sim_index)
+)
+legend(
+  "bottomright",
+  legend = paste0("Month ", plot_months),
+  col = curve_cols, lwd = 2, bg = "white", cex = 0.85
+)
+
+# --- 4c. Fan chart: one tenor's simulated path across all sims -------------
+tenor_to_plot <- "120M"   # 10Y point
+tenor_idx <- which(names(yc$mean_curve) == tenor_to_plot)
+tenor_paths <- sapply(1:num_sims, function(s) {
+  yc$mean_curve[tenor_idx] +
+    yc$pc_sim[, , s] %*% yc$loadings_k[tenor_idx, ] +
+    yc$resid_sim[, tenor_idx, s]
+})
+
+p05_yield <- apply(tenor_paths, 1, quantile, probs = 0.05)
+p50_yield <- apply(tenor_paths, 1, quantile, probs = 0.50)
+p95_yield <- apply(tenor_paths, 1, quantile, probs = 0.95)
+
+matplot(
+  1:horizon, tenor_paths,
+  type = "l", lty = 1,
+  col = rgb(0.2, 0.4, 0.8, alpha = 0.03),
+  xlab = "Month", ylab = sprintf("%s Yield (%%)", tenor_to_plot),
+  main = sprintf("Simulated %s Yield Paths (%d Simulations)", tenor_to_plot, num_sims)
+)
+lines(1:horizon, p05_yield, col = "firebrick", lwd = 2)
+lines(1:horizon, p50_yield, col = "black",     lwd = 2.5)
+lines(1:horizon, p95_yield, col = "darkgreen", lwd = 2)
+legend(
+  "topright",
+  legend = c("95th Percentile", "Median", "5th Percentile"),
+  col = c("darkgreen", "black", "firebrick"),
+  lwd = c(2, 2.5, 2), bg = "white", cex = 0.85
+)
 

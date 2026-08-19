@@ -14,6 +14,17 @@
 # that first instalment can never come from a bond - it is set aside as cash
 # rather than being made the optimizer's problem.
 #
+# The income being funded is NOT level: `Inflation_pa` (annual %, default 5.7)
+# escalates the withdrawal every month, so the ladder is sized against a rising
+# income rather than a flat one. Setting Inflation_pa = 0 recovers the old
+# level-income ladder exactly.
+#
+# Argument-order note: Inflation_pa sits BEFORE ladder_years in every signature
+# below, matching the agreed public API. It has a default and ladder_years does
+# not, so positional calls must still pass it - optimize_bond_ladder(pot, wd,
+# ladder_years) would read ladder_years as the inflation rate. Pass ladder_years
+# by name if in doubt.
+#
 # There is no PV/duration/convexity/PV01 matching here. Matching cash flows
 # month by month is a stronger requirement than matching sensitivities: if the
 # money is there when it is needed, the ladder does its job regardless of what
@@ -200,22 +211,41 @@ calculate_bond_metrics <- function(bonds_fixed, valuation_date) {
 # immediately (t = 0) and the last at the start of the final month of the
 # ladder. ladder_years can be fractional (a mid-year rebalance), so work in
 # whole months throughout.
-calculate_liability_metrics <- function(total_pot_value, withdrawal_rate_pct, ladder_years) {
+#
+# The instalment grows with inflation month by month. `Inflation_pa` is an
+# ANNUAL rate in percent, converted to the equivalent monthly rate
+#     i_m = (1 + Inflation_pa/100)^(1/12) - 1
+# so twelve monthly step-ups compound to exactly Inflation_pa over the year.
+# Month 1 is paid unescalated (it is drawn today); month m is paid
+#     W * (1 + i_m)^(m - 1).
+# Stepping monthly rather than annually keeps this liability consistent with the
+# CPI-indexed monthly payout the simulation actually makes.
+calculate_liability_metrics <- function(total_pot_value, withdrawal_rate_pct,
+                                       Inflation_pa = 5.7, ladder_years) {
+
+  if (!is.finite(Inflation_pa) || Inflation_pa <= -100) {
+    stop("Inflation_pa must be a finite annual rate in percent, greater than -100")
+  }
 
   annual_withdrawal  <- total_pot_value * (withdrawal_rate_pct / 100)
   monthly_withdrawal <- annual_withdrawal / 12
   n_months           <- max(1L, as.integer(round(ladder_years * 12)))
 
+  i_m   <- (1 + Inflation_pa / 100)^(1 / 12) - 1
   t_vec <- (seq_len(n_months) - 1) / 12          # annuity-due: t = 0, 1/12, ...
+  w_vec <- monthly_withdrawal * (1 + i_m)^(seq_len(n_months) - 1)
   y_vec <- curve_yield(t_vec) / 100
-  pv_t  <- monthly_withdrawal * (1 + y_vec)^(-t_vec)
+  pv_t  <- w_vec * (1 + y_vec)^(-t_vec)
 
-  list(annual_withdrawal  = annual_withdrawal,
-       monthly_withdrawal = monthly_withdrawal,
-       n_months           = n_months,
-       total_withdrawn    = monthly_withdrawal * n_months,
-       pv                 = sum(pv_t),
-       mac_duration       = sum(t_vec * pv_t) / sum(pv_t))
+  list(annual_withdrawal   = annual_withdrawal,
+       monthly_withdrawal  = monthly_withdrawal,   # month 1, before any escalation
+       monthly_withdrawals = w_vec,                # the full escalating schedule
+       inflation_pa        = Inflation_pa,
+       monthly_inflation   = i_m,
+       n_months            = n_months,
+       total_withdrawn     = sum(w_vec),
+       pv                  = sum(pv_t),
+       mac_duration        = sum(t_vec * pv_t) / sum(pv_t))
 }
 
 # ------------------------------------------------------------------------------
@@ -225,9 +255,11 @@ calculate_liability_metrics <- function(total_pot_value, withdrawal_rate_pct, la
 #   - Bond flows are bucketed by month_index_from_date(), floored at month 2.
 #   - Withdrawals are paid at the START of each month, m = 1..n_months.
 #
-# Because coupons are lumpy (semi-annual) and withdrawals are level (monthly),
+# Because coupons are lumpy (semi-annual) and withdrawals are monthly,
 # net_cashflow is negative in most months and sharply positive in coupon and
-# redemption months. `cum_net` is the running total on zero starting cash;
+# redemption months. Withdrawals escalate at Inflation_pa (same monthly
+# conversion as calculate_liability_metrics()), so `annual_withdrawal` fixes the
+# STARTING rate of income, not the amount paid in every month. `cum_net` is the running total on zero starting cash;
 # `balance` adds the starting cash the ladder is actually bought with, which by
 # construction is one monthly instalment. Month 1's cum_net is always exactly
 # minus one instalment, so balance starts at 0 and must stay >= 0 thereafter.
@@ -236,6 +268,7 @@ calculate_liability_metrics <- function(total_pot_value, withdrawal_rate_pct, la
 # optimize_bond_ladder() always uses the default.
 ladder_cashflow_schedule <- function(bond_units,
                                      annual_withdrawal,
+                                     Inflation_pa   = 5.7,
                                      ladder_years,
                                      bonds          = bonds_fixed,
                                      valuation_date = NULL,
@@ -258,9 +291,17 @@ ladder_cashflow_schedule <- function(bond_units,
     }
   }
 
+  if (!is.finite(Inflation_pa) || Inflation_pa <= -100) {
+    stop("Inflation_pa must be a finite annual rate in percent, greater than -100")
+  }
+
   n_months           <- max(1L, as.integer(round(ladder_years * 12)))
   monthly_withdrawal <- annual_withdrawal / 12
   months             <- seq_len(n_months)
+
+  # the escalating instalments; month 1 is paid unescalated
+  i_m                 <- (1 + Inflation_pa / 100)^(1 / 12) - 1
+  monthly_withdrawals <- monthly_withdrawal * (1 + i_m)^(months - 1)
 
   held <- bond_units[!is.na(bond_units) & bond_units > 0]
 
@@ -299,7 +340,7 @@ ladder_cashflow_schedule <- function(bond_units,
     bond_inflow   = bucket(in_ladder),
     coupon_in     = bucket(in_ladder & !is_redemption),
     redemption_in = bucket(in_ladder & is_redemption),
-    withdrawal    = rep(monthly_withdrawal, n_months),
+    withdrawal    = monthly_withdrawals,
     stringsAsFactors = FALSE
   )
   schedule$net_cashflow <- schedule$bond_inflow - schedule$withdrawal
@@ -309,9 +350,12 @@ ladder_cashflow_schedule <- function(bond_units,
   list(schedule           = schedule,
        bond_flows         = bond_flows[in_ladder, ],
        overhang           = bond_flows[!in_ladder, ],
-       n_months           = n_months,
-       starting_cash      = starting_cash,
-       monthly_withdrawal = monthly_withdrawal,
+       n_months            = n_months,
+       starting_cash       = starting_cash,
+       monthly_withdrawal  = monthly_withdrawal,
+       monthly_withdrawals = monthly_withdrawals,
+       inflation_pa        = Inflation_pa,
+       monthly_inflation   = i_m,
        total_inflow       = sum(schedule$bond_inflow),
        total_withdrawn    = sum(schedule$withdrawal),
        overhang_value     = if (nrow(bond_flows)) sum(bond_flows$amount[!in_ladder]) else 0,
@@ -344,15 +388,22 @@ bond_units_from_weights <- function(weights, sleeve_value, bonds = bonds_fixed) 
 #               only bonds redeeming inside the ladder are eligible
 #
 # The balance constraint written out. The ladder starts with exactly one monthly
-# instalment in cash (C0 = W), pays W at the start of each month, and receives
-# bond flows as they land:
+# instalment in cash (C0 = W_1), pays the escalating instalment W_m at the start
+# of each month m, and receives bond flows as they land:
 #
-#   balance_m = W + sum_j x_j * CumIn[m, j] / price_j - m*W  >= 0
-#             =>  sum_j x_j * CumIn[m, j] / price_j  >=  (m - 1) * W
+#   balance_m = W_1 + sum_j x_j * CumIn[m, j] / price_j - sum_{k<=m} W_k  >= 0
+#             =>  sum_j x_j * CumIn[m, j] / price_j  >=  CumW_m - W_1
 #
 # where CumIn[m, j] is bond j's cumulative cash flow per R100 par through month
-# m. At m = 1 this reads 0 >= 0 - true for any portfolio, which is exactly the
-# "month 1 is covered by cash" rule - so the LP only carries months 2..n.
+# m, and CumW_m is the cumulative income paid through month m. With no inflation
+# the right-hand side collapses to (m - 1) * W, the level-income case. At m = 1
+# it reads 0 >= 0 - true for any portfolio, which is exactly the "month 1 is
+# covered by cash" rule - so the LP only carries months 2..n.
+#
+# Escalation makes the ladder strictly more expensive, and disproportionately so
+# at the long end: the last month of a 10-year ladder at 5.7% needs 1.057^9.92
+# ~= 1.73x the first month's income, so the longer maturities have to fund much
+# more than a level liability would ask of them.
 #
 # The bond universe (bonds_fixed) is taken from this file. So is t0, unless a
 # `valuation_date` is passed: the dynamic simulation rebalances the ladder
@@ -373,15 +424,18 @@ bond_units_from_weights <- function(weights, sleeve_value, bonds = bonds_fixed) 
 #   liability        calculate_liability_metrics() output
 #   schedule         the realised ladder_cashflow_schedule()
 #   min_balance      tightest cash balance over the ladder (should be ~0)
-#   n_months, ladder_years, eligible_bonds
-optimize_bond_ladder <- function(total_pot_value, withdrawal_rate_pct, ladder_years,
-                                 valuation_date = NULL) {
+#   n_months, ladder_years, inflation_pa, eligible_bonds
+optimize_bond_ladder <- function(total_pot_value, withdrawal_rate_pct, Inflation_pa = 5.7,
+                                 ladder_years, valuation_date = NULL) {
 
   if (is.null(valuation_date)) valuation_date <- get("valuation_date", envir = .GlobalEnv)
 
-  liability <- calculate_liability_metrics(total_pot_value, withdrawal_rate_pct, ladder_years)
+  liability <- calculate_liability_metrics(total_pot_value, withdrawal_rate_pct,
+                                          Inflation_pa = Inflation_pa,
+                                          ladder_years = ladder_years)
   n_months  <- liability$n_months
-  W         <- liability$monthly_withdrawal
+  W         <- liability$monthly_withdrawal      # month 1's instalment, held in cash
+  w_vec     <- liability$monthly_withdrawals     # the escalating schedule
 
   if (!is.finite(W) || W <= 0) stop("liability is zero, negative or non-finite - nothing to fund")
   if (n_months < 2) stop("ladder is shorter than 2 months - month 1 is covered by cash, so there is nothing to solve")
@@ -423,8 +477,11 @@ optimize_bond_ladder <- function(total_pot_value, withdrawal_rate_pct, ladder_ye
   # every coefficient sits near 1 - without that, rand amounts (~1e7) and
   # per-rand cash flow coefficients (~1e0) span seven orders of magnitude and
   # lpSolve's default tolerances start to bite.
+  # rhs_m = cumulative income paid through month m, less the month-1 instalment
+  # already sitting in cash. Strictly increasing and > 0 for every m >= 2, so
+  # scaling each row by its own rhs is always safe.
   m_rows <- 2:n_months
-  rhs    <- (m_rows - 1) * W
+  rhs    <- cumsum(w_vec)[m_rows] - W
   scale  <- liability$annual_withdrawal
 
   # A month that NO eligible bond can reach is unsatisfiable however much is
@@ -483,7 +540,9 @@ optimize_bond_ladder <- function(total_pot_value, withdrawal_rate_pct, ladder_ye
   # --- verify against the schedule, rebuilt from scratch --------------------
   # Not trusting the LP matrix is the point: if the two ever disagree, the
   # bucketing conventions have drifted apart and this catches it.
-  sched <- ladder_cashflow_schedule(bond_units, liability$annual_withdrawal, ladder_years,
+  sched <- ladder_cashflow_schedule(bond_units, liability$annual_withdrawal,
+                                    Inflation_pa   = Inflation_pa,
+                                    ladder_years   = ladder_years,
                                     valuation_date = valuation_date)
 
   list(total_cost     = total_cost,
@@ -497,6 +556,7 @@ optimize_bond_ladder <- function(total_pot_value, withdrawal_rate_pct, ladder_ye
        min_balance    = sched$min_balance,
        n_months       = n_months,
        ladder_years   = ladder_years,
+       inflation_pa   = Inflation_pa,
        eligible_bonds = codes)
 }
 
@@ -513,8 +573,11 @@ print_ladder_optimization <- function(res, digits = 2) {
   cat(sprintf(" CHEAPEST SELF-FUNDING LADDER  |  %.2f years (%d months)\n",
               res$ladder_years, res$n_months))
   cat("=================================================================\n")
-  cat(sprintf(" Income secured       : R %s p.a.  (R %s per month)\n",
+  cat(sprintf(" Income secured       : R %s p.a.  (R %s in month 1)\n",
               fmt(res$liability$annual_withdrawal), fmt(res$liability$monthly_withdrawal)))
+  cat(sprintf(" Escalating at        : %.2f%% p.a.  (R %s by month %d)\n",
+              res$liability$inflation_pa,
+              fmt(res$liability$monthly_withdrawals[res$n_months]), res$n_months))
   cat(sprintf(" Total paid out       : R %s over the ladder\n",
               fmt(res$liability$total_withdrawn)))
   cat("-----------------------------------------------------------------\n")
@@ -546,4 +609,8 @@ print_ladder_optimization <- function(res, digits = 2) {
   invisible(res)
 }
 
+res = optimize_bond_ladder(10000000,4,Inflation_pa = 5.7,15)
+print_ladder_optimization(res)
+ladder_cashflow_schedule()
+ladder_cashflow_schedule(res$bond_units,400000,5.7,15)
 
