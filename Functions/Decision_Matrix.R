@@ -6,8 +6,9 @@
 #                      expenses (now through max_age) - not just the cost
 #                      of fully funding the current bond ladder
 #   equity_return   = Previous 12-month equity return (decimal)
-#   inflation_rate  = Inflation for current year (decimal)
-#   current_income  = Current annual withdrawal
+#   inflation_rate  = Expected inflation (decimal). Used ONLY to classify the
+#                      state; it no longer escalates income - see below.
+#   current_income  = Current annual withdrawal, a T0-REAL level
 #   defend_cut      = Spending cut in Defend state (default = 5%)
 #
 # Outputs:
@@ -17,6 +18,23 @@
 #     - whether to extend ladder
 #     - whether to harvest equities
 #     - whether inflation increase is applied
+#
+# INCOME IS REAL, AND ONLY DEFEND MOVES IT
+#
+# `current_income` is a T0-REAL annual level and the engine indexes the actual
+# monthly payment by realized CPI since t0 (see run_dynamic_ladder_simulation()).
+# Purchasing power is therefore already preserved without this function doing
+# anything, so Extend & Harvest returns the income UNCHANGED: it extends the
+# ladder and harvests equity to pay for it, and that is all.
+#
+# Extend & Harvest used to return current_income * (1 + inflation_rate). That
+# cancelled against an `income_reset_month` in the engine which re-based the CPI
+# indexation on every reset - so the raise was inflation compensation, not a real
+# raise, but ONLY when a reset fired every 12 months AND realized inflation was
+# exactly inflation_rate. Off either condition the real income drifted with no
+# decision having been taken (at 10% realized inflation it eroded 24% over seven
+# years; a single Extend after three Hold years cut it 14% outright). The reset
+# is gone and so is the raise; the two only ever made sense together.
 ###############################################################
 
 decision_matrix <- function(funded_ratio,
@@ -38,8 +56,6 @@ decision_matrix <- function(funded_ratio,
 
   if (surplus & market_positive) {
 
-    new_income <- current_income * (1 + inflation_rate)
-
     return(list(
       action = "Extend & Harvest",
 
@@ -49,12 +65,14 @@ decision_matrix <- function(funded_ratio,
       extend_ladder = TRUE,
       harvest_equity = TRUE,
 
-      inflation_raise = TRUE,
+      # Income is untouched: it is a REAL level and the engine indexes it to
+      # realized CPI from t0, so no raise is needed to preserve it.
+      inflation_raise = FALSE,
       spending_cut = FALSE,
 
-      withdrawal = new_income,
+      withdrawal = current_income,
 
-      notes = "Harvest equity gains and purchase the next rung of the bond ladder."
+      notes = "Harvest equity gains and purchase the next rung of the bond ladder. Real income unchanged."
     ))
   }
 
