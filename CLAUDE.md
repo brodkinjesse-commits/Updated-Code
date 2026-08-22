@@ -248,6 +248,7 @@ original defect back in and confirms the corresponding check fires:
 
 ```
 Thesis.R                          # MAIN entry point. Runs headless under Rscript.
+Run_And_Save.R                    # WRAPPER entry point - sources Thesis.R, saves the bundle
 Functions/
   moving_block_bootstrap.R        # sourced 1st - equity/bond/CPI bootstrap
   Bond Selection ILB.R            # sourced 2nd - THE ILB selector (~1130 lines)
@@ -259,9 +260,11 @@ Functions/
   ILB_Indexation.R                # sourced 8th - Reference CPI + THE real->nominal bridge
   ILB_Repricing.R                 # sourced 9th - reprice/extend the ladder at future dates
   Invariants.R                    # sourced 10th - identities, boundary checks, audit
+  Summarise_Run.R                 # NOT sourced by Thesis.R - reporting layer for saved runs
   Sensitivity_Analysis.R          # SECOND entry point - BROKEN, not migrated
   bootstrap_returns.R             # LEGACY, unused
 Data/                             # gitignored - present locally only
+Runs/                             # gitignored - .rds run bundles, tens of MB each
 sensitivity_plots/                # five PNGs - STALE, from the old nominal Redington model
 Rplots.pdf                        # tracked build artifact; probably should be gitignored
 ```
@@ -504,6 +507,69 @@ inflation, exactly as the withdrawals are.
 The headline figure is the **equity-plus-residual-cash** one. The old equity-only number is
 still printed beside it so the size of the measurement effect stays visible, and terminal values
 are reported in today's rands as well as nominal.
+
+---
+
+## Saving and re-reading a run
+
+`Thesis.R` prints a full report and then throws the results away. At ~30 minutes for 1,000
+paths, re-checking a single figure — or comparing the dynamic strategy against a static arm —
+used to mean paying the 30 minutes again. Two files fix that. Neither is sourced by `Thesis.R`;
+both sit outside the model.
+
+**`Run_And_Save.R`** — a wrapper entry point. Sets `RUN_LABEL`, checks the working directory is
+the project root, `source()`s `Thesis.R` **unmodified**, then writes an `.rds` **bundle** to
+`Runs/`: a timestamped file that is never overwritten, plus `Runs/latest.rds` as the handle.
+
+The bundle is deliberately **not** just `sim_result`. It carries `nfac_all`, `res_ilb`,
+`audit_ok`, and a `params` list holding every parameter the run actually used, alongside `meta`
+(label, timestamps, elapsed, R version, git commit). The pairing is the point: a summary
+computed against parameters the run did not use is exactly the class of silent error the
+invariant layer exists to prevent, and it is trivially easy to make by hand six weeks later.
+`audit_ok` travels *with* the numbers rather than in a console log that scrolled away — a bundle
+whose audit failed is a bundle whose numbers must not be quoted.
+
+**`Functions/Summarise_Run.R`** — `summarise_run(x)` takes either a bundle or a bare
+`sim_result` and reprints the income / terminal-wealth / ruin / mechanics report, returning the
+values invisibly. It re-derives **nothing**: every figure is computed the way `Thesis.R`
+computes it, from the same fields. It reads the CPI bridge off `sim_result$nominal_factor` (the
+engine's own copy of `nfac_all`) so it works in a fresh session with none of the model sourced.
+`compare_runs(list(dynamic = ..., static = ...))` tabulates two or more bundles side by side —
+which is how the `decisions_enabled = FALSE` arm gets compared.
+
+```r
+source("Functions/Summarise_Run.R")
+summarise_run(readRDS("Runs/latest.rds"))
+```
+
+`Runs/` is gitignored. Bundles are ~19 MB each and are run **output**, not source.
+
+**Ordering that matters:** `Run_And_Save.R` writes the bundle *before* it runs its round-trip
+summary, so a crash in the reporting layer never costs the run. That ordering has already paid
+for itself once.
+
+### The off-by-one in the reporting layer
+
+`summarise_run()` originally took the horizon as `nrow(sim_result$EPort_history)`. **The balance
+histories are `horizon + 1` rows deep** — row 1 is the t0 opening balance (`Dynamic_Ladder.R`
+allocates them that way) — while the *flow* histories (`Income_real_history`, the cash flows)
+are exactly `horizon`. So `horizon` came out as 361 and `nominal_factor[horizon + 1, ]` ran one
+row past the end: `subscript out of bounds`.
+
+It now reads the horizon off a flow history and **asserts** the two shapes agree:
+
+```r
+horizon  <- nrow(sim_result$Income_real_history)
+num_sims <- ncol(sim_result$Income_real_history)
+stopifnot(nrow(sim_result$EPort_history)  == horizon + 1L,
+          nrow(sim_result$nominal_factor) >= horizon + 1L)
+```
+
+Worth noting *why* this one was harmless where the five real/nominal defects were not: it threw
+immediately. `nfac_all[horizon + 1, ]` in `Thesis.R` is correct — there `horizon` is the
+parameter, 360, not a row count. **Anything reading a month index off a matrix must know which
+of the two shapes it is holding**; the two conventions are stated in the month-convention
+section above and are load-bearing here too.
 
 ---
 
@@ -1001,7 +1067,10 @@ and the path locks. The comment in the file now says so.
    `run_dynamic_ladder_simulation_toggle()` in favour of the engine's own `decisions_enabled`
    argument, and regenerate the five PNGs.
 2. **Build the static comparator** off `decisions_enabled = FALSE`, then Hulett & Swanepoel
-   (2024).
+   (2024). `Run_And_Save.R` + `compare_runs()` are the machinery for it — save the static arm
+   under its own `RUN_LABEL` and table the two bundles against each other. Note that
+   `Run_And_Save.R` hardcodes `decisions_enabled = TRUE` in its saved `params`; it must be
+   threaded through properly before the static arm is saved, or the bundle will mislabel itself.
 3. **Speed up the simulation** — vectorising repricing across paths is the obvious win.
 4. **Calibrate the breakeven process** against real SA breakeven data.
 5. **Revisit `ladder_locked` at the cap** — on this universe a 15-year cap makes locking

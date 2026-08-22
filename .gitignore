@@ -11,3 +11,5 @@ renv/staging/
 # OS junk
 .DS_Store
 Thumbs.db
+# Run output
+Runs/
